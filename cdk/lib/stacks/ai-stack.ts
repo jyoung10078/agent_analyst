@@ -1,11 +1,13 @@
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as cr from 'aws-cdk-lib/custom-resources';
 import * as opensearchserverless from 'aws-cdk-lib/aws-opensearchserverless';
 import * as bedrock from 'aws-cdk-lib/aws-bedrock';
+import * as path from 'path';
 import { Construct } from 'constructs';
 
 interface AIStackProps extends cdk.StackProps {
-  /** The name of the documents S3 bucket (deterministic, includes account+region) */
   documentsBucketNameToken: string;
 }
 
@@ -17,24 +19,18 @@ export class AIStack extends cdk.Stack {
     super(scope, id, props);
 
     const collectionName = 'agent-analyst-kb';
-
     const documentsBucketArn = `arn:aws:s3:::${props.documentsBucketNameToken}`;
 
-    // OpenSearch Serverless encryption policy
-    const encryptionPolicy = new opensearchserverless.CfnSecurityPolicy(
-      this,
-      'EncryptionPolicy',
-      {
-        name: `${collectionName}-enc`,
-        type: 'encryption',
-        policy: JSON.stringify({
-          Rules: [{ ResourceType: 'collection', Resource: [`collection/${collectionName}`] }],
-          AWSOwnedKey: true,
-        }),
-      }
-    );
+    // ── OpenSearch Serverless policies ────────────────────────────
+    const encryptionPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'EncryptionPolicy', {
+      name: `${collectionName}-enc`,
+      type: 'encryption',
+      policy: JSON.stringify({
+        Rules: [{ ResourceType: 'collection', Resource: [`collection/${collectionName}`] }],
+        AWSOwnedKey: true,
+      }),
+    });
 
-    // OpenSearch Serverless network policy (public for simplicity)
     const networkPolicy = new opensearchserverless.CfnSecurityPolicy(this, 'NetworkPolicy', {
       name: `${collectionName}-net`,
       type: 'network',
@@ -49,7 +45,7 @@ export class AIStack extends cdk.Stack {
       ]),
     });
 
-    // IAM role for Bedrock Knowledge Base
+    // ── IAM role for Bedrock Knowledge Base ───────────────────────
     const kbRole = new iam.Role(this, 'KnowledgeBaseRole', {
       roleName: 'agent-analyst-kb-role',
       assumedBy: new iam.ServicePrincipal('bedrock.amazonaws.com'),
@@ -57,19 +53,16 @@ export class AIStack extends cdk.Stack {
         BedrockKBPolicy: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
-              effect: iam.Effect.ALLOW,
               actions: ['bedrock:InvokeModel'],
               resources: [
                 `arn:aws:bedrock:${this.region}::foundation-model/amazon.titan-embed-text-v2:0`,
               ],
             }),
             new iam.PolicyStatement({
-              effect: iam.Effect.ALLOW,
               actions: ['s3:GetObject', 's3:ListBucket'],
               resources: [documentsBucketArn, `${documentsBucketArn}/*`],
             }),
             new iam.PolicyStatement({
-              effect: iam.Effect.ALLOW,
               actions: ['aoss:APIAccessAll'],
               resources: [`arn:aws:aoss:${this.region}:${this.account}:collection/*`],
             }),
@@ -78,16 +71,33 @@ export class AIStack extends cdk.Stack {
       },
     });
 
-    // OpenSearch Serverless collection
+    // ── IAM role for the Custom Resource Lambda ───────────────────
+    const crRole = new iam.Role(this, 'IndexCreatorRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+      ],
+      inlinePolicies: {
+        AOSSPolicy: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['aoss:APIAccessAll'],
+              resources: [`arn:aws:aoss:${this.region}:${this.account}:collection/*`],
+            }),
+          ],
+        }),
+      },
+    });
+
+    // ── OpenSearch Serverless collection ──────────────────────────
     const collection = new opensearchserverless.CfnCollection(this, 'KBCollection', {
       name: collectionName,
       type: 'VECTORSEARCH',
-      description: 'Vector store for Agent Analyst knowledge base',
     });
     collection.addDependency(encryptionPolicy);
     collection.addDependency(networkPolicy);
 
-    // Data access policy — grants KB role access to the collection
+    // ── Data access policies (KB role + CR Lambda role) ───────────
     const dataAccessPolicy = new opensearchserverless.CfnAccessPolicy(this, 'DataAccessPolicy', {
       name: `${collectionName}-access`,
       type: 'data',
@@ -117,13 +127,40 @@ export class AIStack extends cdk.Stack {
               ],
             },
           ],
-          Principal: [kbRole.roleArn],
+          // Both the KB role and the CR Lambda role need access
+          Principal: [kbRole.roleArn, crRole.roleArn],
         },
       ]),
     });
     dataAccessPolicy.addDependency(collection);
 
-    // Bedrock Knowledge Base
+    // ── Custom Resource: create the vector index ──────────────────
+    const indexCreatorFn = new lambda.Function(this, 'IndexCreatorFn', {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset(
+        path.join(__dirname, '../cr-handlers/create-os-index')
+      ),
+      timeout: cdk.Duration.minutes(10),
+      role: crRole,
+      environment: { REGION: this.region },
+    });
+
+    const indexCreatorProvider = new cr.Provider(this, 'IndexCreatorProvider', {
+      onEventHandler: indexCreatorFn,
+    });
+
+    const createIndex = new cdk.CustomResource(this, 'CreateOSIndex', {
+      serviceToken: indexCreatorProvider.serviceToken,
+      properties: {
+        CollectionEndpoint: collection.attrCollectionEndpoint,
+        // change this value to force re-run on updates
+        Nonce: '1',
+      },
+    });
+    createIndex.node.addDependency(dataAccessPolicy);
+
+    // ── Bedrock Knowledge Base ─────────────────────────────────────
     const knowledgeBase = new bedrock.CfnKnowledgeBase(this, 'KnowledgeBase', {
       name: 'agent-analyst-kb',
       roleArn: kbRole.roleArn,
@@ -146,10 +183,10 @@ export class AIStack extends cdk.Stack {
         },
       },
     });
-    knowledgeBase.addDependency(dataAccessPolicy);
+    knowledgeBase.node.addDependency(createIndex);
     knowledgeBase.node.addDependency(kbRole);
 
-    // Bedrock Data Source pointing at the documents S3 bucket
+    // ── Bedrock Data Source ────────────────────────────────────────
     const dataSource = new bedrock.CfnDataSource(this, 'DataSource', {
       name: 'agent-analyst-documents',
       knowledgeBaseId: knowledgeBase.attrKnowledgeBaseId,
