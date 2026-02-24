@@ -1,0 +1,15 @@
+{
+  "name": "agent-analyst",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "cdk",
+    "backend",
+    "frontend"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=backend && npm run build --workspace=frontend",
+    "deploy": "npm run build && cd cdk && npx cdk deploy --all --require-approval broadening",
+    "synth": "cd cdk && npx cdk synth"
+  }
+}
